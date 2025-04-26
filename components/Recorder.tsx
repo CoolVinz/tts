@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
+import { useRouter, useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 interface Owner {
@@ -15,75 +16,107 @@ interface Sentence {
 }
 
 export default function Recorder() {
-  const [sentences, setSentences] = useState<Sentence[]>([]);
+  const router = useRouter();
+  const searchParams = useSearchParams();
+
   const [owners, setOwners] = useState<Owner[]>([]);
-  const [currentIndex, setCurrentIndex] = useState(0);
+  const [sentences, setSentences] = useState<Sentence[]>([]);
   const [voiceOwner, setVoiceOwner] = useState<string>("");
+  const [currentIndex, setCurrentIndex] = useState<number>(0);
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(
     null
   );
-  const [audioChunks, setAudioChunks] = useState<Blob[]>([]);
   const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
+  const [recordedSentenceIds, setRecordedSentenceIds] = useState<number[]>([]);
+
+  // ✅ Progress ตามจำนวนไฟล์เสียงจริง
+  const progressPercent =
+    (recordedSentenceIds.length / (sentences.length || 1)) * 100;
 
   useEffect(() => {
     async function fetchData() {
-      const { data: sentenceData, error: sentenceError } = await supabase
+      const { data: ownerData } = await supabase.from("owners").select("*");
+      const { data: sentenceData } = await supabase
         .from("sentences")
-        .select("*")
-        .order("id", { ascending: true });
+        .select("*");
 
-      if (sentenceError) {
-        console.error(sentenceError);
-        return;
-      }
-      setSentences(sentenceData as Sentence[]);
-
-      const { data: ownerData, error: ownerError } = await supabase
-        .from("owners")
-        .select("*")
-        .order("id", { ascending: true });
-
-      if (ownerError) {
-        console.error(ownerError);
-        return;
-      }
-      setOwners(ownerData as Owner[]);
-
-      // ตั้ง owner default เป็นตัวแรก
       if (ownerData && ownerData.length > 0) {
-        setVoiceOwner(ownerData[0].name);
+        setOwners(ownerData);
+
+        const ownerParam = searchParams.get("owner");
+        if (ownerParam) {
+          setVoiceOwner(ownerParam);
+        } else {
+          setVoiceOwner(ownerData[0].name);
+        }
+      }
+
+      if (sentenceData && sentenceData.length > 0) {
+        setSentences(sentenceData);
       }
     }
 
     fetchData();
   }, []);
 
-  if (sentences.length === 0 || owners.length === 0)
-    return <div>Loading...</div>;
+  useEffect(() => {
+    async function fetchRecordedSentences() {
+      if (!voiceOwner) return;
 
-  // 🎯 ฟังก์ชัน Validate Owner Name (Clean Name Check)
-  const validateOwnerName = (name: string) => /^[a-z0-9_]+$/.test(name);
+      const { data } = await supabase
+        .from("recordings")
+        .select("sentence_id")
+        .eq("owner", voiceOwner);
+
+      if (data) {
+        const ids = data.map(
+          (item: { sentence_id: number }) => item.sentence_id
+        );
+        setRecordedSentenceIds(ids);
+      }
+    }
+
+    fetchRecordedSentences();
+  }, [voiceOwner]);
+
+  if (owners.length === 0 || sentences.length === 0) {
+    return <div className="text-center mt-10 text-xl">Loading...</div>;
+  }
+
+  const isAlreadyRecorded = recordedSentenceIds.includes(
+    sentences[currentIndex].id
+  );
 
   const startRecording = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    const recorder = new MediaRecorder(stream);
+
+    const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
+    let localAudioChunks: Blob[] = [];
+
+    recorder.ondataavailable = (event) => {
+      if (event.data.size > 0) {
+        localAudioChunks.push(event.data);
+      }
+    };
+
+    recorder.onstop = async () => {
+      const audioBlob = new Blob(localAudioChunks, { type: "audio/webm" });
+      setRecordedBlob(audioBlob);
+      setIsRecording(false);
+
+      await saveRecording(audioBlob);
+      moveToNextSentence();
+    };
+
     recorder.start();
-    setAudioChunks([]);
-
-    recorder.addEventListener("dataavailable", (event) => {
-      setAudioChunks((prev) => [...prev, event.data]);
-    });
-
-    recorder.addEventListener("stop", () => {
-      const blob = new Blob(audioChunks, { type: "audio/wav" });
-      setRecordedBlob(blob);
-    });
-
     setMediaRecorder(recorder);
+    setIsRecording(true);
   };
 
   const stopRecording = () => {
     mediaRecorder?.stop();
+    setIsRecording(false);
   };
 
   const playNewRecording = () => {
@@ -96,40 +129,43 @@ export default function Recorder() {
 
   const playOldRecording = async () => {
     const sentence = sentences[currentIndex];
-    const filename = sentence.id.toString().padStart(4, "0") + ".wav";
-    const { data } = await supabase.storage
-      .from("recordings")
-      .getPublicUrl(`${voiceOwner}/${filename}`);
+    const filename = sentence.id.toString().padStart(4, "0") + ".webm";
+    const path = `${voiceOwner}/${filename}`;
 
-    if (data?.publicUrl) {
-      const audio = new Audio(data.publicUrl);
-      audio.play();
-    }
-  };
+    const { data } = supabase.storage.from("recordings").getPublicUrl(path);
 
-  const saveRecording = async () => {
-    if (!recordedBlob) return;
-    if (!validateOwnerName(voiceOwner)) {
-      alert(
-        "Owner name invalid. Only lowercase letters, numbers, and underscore allowed."
-      );
+    if (!data?.publicUrl) {
+      console.error("Public URL not found.");
+      alert("Cannot find old recording.");
       return;
     }
 
+    const audio = new Audio(data.publicUrl);
+
+    audio.onerror = (e) => {
+      console.error("Audio error:", e);
+      alert("Failed to load or play audio.");
+    };
+
+    audio.play();
+  };
+
+  const saveRecording = async (blob: Blob) => {
     const sentence = sentences[currentIndex];
-    const filename = sentence.id.toString().padStart(4, "0") + ".wav";
+    const filename = sentence.id.toString().padStart(4, "0") + ".webm";
     const filePath = `${voiceOwner}/${filename}`;
 
     const { error: uploadError } = await supabase.storage
       .from("recordings")
-      .upload(filePath, recordedBlob, {
+      .upload(filePath, blob, {
         cacheControl: "3600",
         upsert: true,
+        contentType: "audio/webm",
       });
 
     if (uploadError) {
-      console.error(uploadError);
-      alert("Error uploading file.");
+      console.error("Upload error:", uploadError);
+      alert("Error uploading audio.");
       return;
     }
 
@@ -144,34 +180,70 @@ export default function Recorder() {
     });
 
     if (insertError) {
-      console.error(insertError);
+      console.error("Insert error:", insertError);
       alert("Error saving metadata.");
       return;
     }
 
-    alert("Recording saved successfully!");
+    setRecordedSentenceIds((prev) => [...prev, sentence.id]);
   };
 
-  const nextSentence = () => {
+  const moveToNextSentence = () => {
     if (currentIndex < sentences.length - 1) {
-      setRecordedBlob(null);
       setCurrentIndex(currentIndex + 1);
+      setRecordedBlob(null);
     } else {
-      alert("All sentences are completed!");
+      alert("All sentences completed!");
+    }
+  };
+
+  const prevSentence = () => {
+    if (currentIndex > 0) {
+      setCurrentIndex(currentIndex - 1);
+      setRecordedBlob(null);
+    } else {
+      alert("Already at the first sentence!");
+    }
+  };
+
+  const jumpToSentence = (value: number) => {
+    if (value >= 1 && value <= sentences.length) {
+      setCurrentIndex(value - 1);
+      setRecordedBlob(null);
     }
   };
 
   return (
-    <div className="flex flex-col items-center gap-4">
-      <h1 className="text-2xl font-bold">Thai TTS Voice Recorder</h1>
+    <div className="flex flex-col items-center gap-6 p-8">
+      {/* Progress Bar */}
+      <div className="w-full max-w-2xl bg-gray-300 rounded-full h-6 overflow-hidden">
+        <div
+          className="bg-green-500 h-full transition-all duration-500"
+          style={{ width: `${progressPercent}%` }}
+        />
+      </div>
 
-      <div>
-        <label htmlFor="owner">Select Voice Owner: </label>
+      <div className="mt-2 text-center text-lg font-semibold">
+        {progressPercent.toFixed(1)}% Completed
+      </div>
+
+      {/* Recording Indicator */}
+      {isRecording && (
+        <div className="text-red-600 font-bold text-lg animate-pulse">
+          Recording... 🎙
+        </div>
+      )}
+
+      {/* Select Owner */}
+      <div className="flex flex-col items-center gap-2">
+        <label htmlFor="owner" className="font-semibold">
+          Select Voice Owner:
+        </label>
         <select
           id="owner"
           value={voiceOwner}
           onChange={(e) => setVoiceOwner(e.target.value)}
-          className="border p-2"
+          className="border p-2 rounded-lg"
         >
           {owners.map((owner) => (
             <option key={owner.id} value={owner.name}>
@@ -181,44 +253,78 @@ export default function Recorder() {
         </select>
       </div>
 
-      <div className="text-xl font-semibold">
+      {/* Jump to Sentence */}
+      <div className="flex items-center gap-2">
+        <label className="font-semibold">Jump to:</label>
+        <input
+          type="number"
+          min="1"
+          max={sentences.length}
+          value={currentIndex + 1}
+          onChange={(e) => jumpToSentence(parseInt(e.target.value, 10))}
+          className="border p-2 rounded-lg w-24 text-center"
+        />
+        <span className="text-sm text-gray-500">(1 - {sentences.length})</span>
+      </div>
+
+      {/* Current Sentence */}
+      <div className="text-2xl font-bold text-center">
         {sentences[currentIndex].text}
       </div>
 
-      <div className="flex gap-2">
-        <button onClick={startRecording} className="bg-green-500 p-2 rounded">
-          Start
+      {/* Current Status */}
+      <div className="text-lg font-semibold mt-2">
+        Current Status:{" "}
+        {isAlreadyRecorded ? (
+          <span className="text-green-500">✅ Already recorded</span>
+        ) : (
+          <span className="text-red-500">❌ Not recorded yet</span>
+        )}
+      </div>
+
+      {/* Buttons */}
+      <div className="flex flex-wrap justify-center gap-4">
+        <button
+          onClick={startRecording}
+          className="bg-green-500 text-white px-4 py-2 rounded-lg"
+          disabled={isRecording}
+        >
+          🎙 Start
         </button>
-        <button onClick={stopRecording} className="bg-red-500 p-2 rounded">
-          Stop
+        <button
+          onClick={stopRecording}
+          className="bg-red-500 text-white px-4 py-2 rounded-lg"
+          disabled={!isRecording}
+        >
+          🛑 Stop
         </button>
         <button
           onClick={playNewRecording}
-          disabled={!recordedBlob}
-          className="bg-blue-500 p-2 rounded"
+          disabled={!recordedBlob || !isAlreadyRecorded}
+          className="bg-blue-500 text-white px-4 py-2 rounded-lg disabled:bg-blue-300"
         >
-          Play New
+          ▶️ Play New
         </button>
         <button
           onClick={playOldRecording}
-          className="bg-yellow-500 p-2 rounded"
+          disabled={!isAlreadyRecorded}
+          className="bg-yellow-500 text-black px-4 py-2 rounded-lg disabled:bg-yellow-300"
         >
-          Play Old
+          🕑 Play Old
         </button>
         <button
-          onClick={saveRecording}
-          disabled={!recordedBlob}
-          className="bg-purple-500 p-2 rounded"
+          onClick={prevSentence}
+          disabled={currentIndex === 0}
+          className="bg-gray-500 text-white px-4 py-2 rounded-lg disabled:bg-gray-300"
         >
-          Save
+          ⏮ Prev
         </button>
-        <button onClick={nextSentence} className="bg-gray-500 p-2 rounded">
-          Next
+        <button
+          onClick={moveToNextSentence}
+          className="bg-gray-500 text-white px-4 py-2 rounded-lg"
+        >
+          ⏭ Next
         </button>
-      </div>
-
-      <div>
-        Progress: {currentIndex + 1} / {sentences.length}
       </div>
     </div>
   );
