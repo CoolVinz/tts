@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react";
 import { supabase } from "@/lib/supabaseClient";
 import JSZip from "jszip";
+// @ts-ignore
 import { saveAs } from "file-saver";
 
 interface Recording {
