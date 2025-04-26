@@ -1,9 +1,10 @@
+import { Suspense } from "react";
 import Recorder from "@/components/Recorder";
 
-export default function Home() {
+export default function Page() {
   return (
-    <main className="flex min-h-screen flex-col items-center justify-center p-10">
+    <Suspense fallback={<div>Loading...</div>}>
       <Recorder />
-    </main>
+    </Suspense>
   );
 }
