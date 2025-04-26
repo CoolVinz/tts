@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useSearchParams } from "next/navigation";
 import { supabase } from "@/lib/supabaseClient";
 
 interface Owner {
@@ -16,23 +16,33 @@ interface Sentence {
 }
 
 export default function Recorder() {
-  const router = useRouter();
   const searchParams = useSearchParams();
-
   const [owners, setOwners] = useState<Owner[]>([]);
   const [sentences, setSentences] = useState<Sentence[]>([]);
   const [voiceOwner, setVoiceOwner] = useState<string>("");
   const [currentIndex, setCurrentIndex] = useState<number>(0);
+  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
+  const [isRecording, setIsRecording] = useState(false);
   const [mediaRecorder, setMediaRecorder] = useState<MediaRecorder | null>(
     null
   );
-  const [recordedBlob, setRecordedBlob] = useState<Blob | null>(null);
-  const [isRecording, setIsRecording] = useState(false);
   const [recordedSentenceIds, setRecordedSentenceIds] = useState<number[]>([]);
+  const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+  const [isSaving, setIsSaving] = useState<boolean>(false);
+  const [statusText, setStatusText] = useState<string>("Ready to Record");
+  const [statusColor, setStatusColor] = useState<string>("text-gray-500");
+  const [recordTimer, setRecordTimer] = useState<number>(0);
+  const [recordIntervalId, setRecordIntervalId] =
+    useState<NodeJS.Timeout | null>(null);
+  const [durations, setDurations] = useState<{ [sentenceId: number]: number }>(
+    {}
+  );
 
-  // ✅ Progress ตามจำนวนไฟล์เสียงจริง
   const progressPercent =
     (recordedSentenceIds.length / (sentences.length || 1)) * 100;
+  const isAlreadyRecorded = recordedSentenceIds.includes(
+    sentences[currentIndex]?.id
+  );
 
   useEffect(() => {
     async function fetchData() {
@@ -41,82 +51,94 @@ export default function Recorder() {
         .from("sentences")
         .select("*");
 
-      if (ownerData && ownerData.length > 0) {
+      if (ownerData) {
         setOwners(ownerData);
-
-        const ownerParam = searchParams.get("owner");
-        if (ownerParam) {
-          setVoiceOwner(ownerParam);
-        } else {
-          setVoiceOwner(ownerData[0].name);
-        }
+        setVoiceOwner(searchParams.get("owner") || ownerData[0].name);
       }
-
-      if (sentenceData && sentenceData.length > 0) {
+      if (sentenceData) {
         setSentences(sentenceData);
       }
     }
-
     fetchData();
   }, []);
 
   useEffect(() => {
-    async function fetchRecordedSentences() {
+    async function fetchRecordedAndDurations() {
       if (!voiceOwner) return;
 
-      const { data } = await supabase
+      const { data: recordedData } = await supabase
         .from("recordings")
         .select("sentence_id")
         .eq("owner", voiceOwner);
 
-      if (data) {
-        const ids = data.map(
-          (item: { sentence_id: number }) => item.sentence_id
+      if (recordedData) {
+        setRecordedSentenceIds(recordedData.map((item) => item.sentence_id));
+      }
+
+      const { data: durationData } = await supabase
+        .from("recordings")
+        .select("sentence_id, storage_url")
+        .eq("owner", voiceOwner);
+
+      if (durationData) {
+        const tempDurations: { [sentenceId: number]: number } = {};
+        await Promise.all(
+          durationData.map(async (item) => {
+            try {
+              const audio = new Audio(item.storage_url + "?v=" + Math.random());
+              await new Promise<void>((resolve) => {
+                audio.addEventListener("loadedmetadata", () => {
+                  if (!isNaN(audio.duration) && isFinite(audio.duration)) {
+                    tempDurations[item.sentence_id] = audio.duration;
+                  }
+                  resolve();
+                });
+              });
+            } catch (err) {
+              console.error("Error loading audio metadata:", err);
+            }
+          })
         );
-        setRecordedSentenceIds(ids);
+        setDurations(tempDurations);
       }
     }
 
-    fetchRecordedSentences();
+    fetchRecordedAndDurations();
   }, [voiceOwner]);
-
-  if (owners.length === 0 || sentences.length === 0) {
-    return <div className="text-center mt-10 text-xl">Loading...</div>;
-  }
-
-  const isAlreadyRecorded = recordedSentenceIds.includes(
-    sentences[currentIndex].id
-  );
 
   const startRecording = async () => {
     const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
     const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
-    let localAudioChunks: Blob[] = [];
+    let chunks: Blob[] = [];
 
-    recorder.ondataavailable = (event) => {
-      if (event.data.size > 0) {
-        localAudioChunks.push(event.data);
-      }
+    recorder.ondataavailable = (e) => {
+      if (e.data.size > 0) chunks.push(e.data);
     };
-
-    recorder.onstop = async () => {
-      const audioBlob = new Blob(localAudioChunks, { type: "audio/webm" });
-      setRecordedBlob(audioBlob);
+    recorder.onstop = () => {
+      setRecordedBlob(new Blob(chunks, { type: "audio/webm" }));
       setIsRecording(false);
-
-      await saveRecording(audioBlob);
-      moveToNextSentence();
+      setSaveSuccess(false);
+      setStatusText("Recording done. Please Save.");
+      setStatusColor("text-yellow-500");
+      if (recordIntervalId) clearInterval(recordIntervalId);
     };
 
     recorder.start();
     setMediaRecorder(recorder);
     setIsRecording(true);
+    setStatusText("Recording...");
+    setStatusColor("text-red-500");
+
+    setRecordTimer(0);
+    const interval = setInterval(() => {
+      setRecordTimer((prev) => prev + 1);
+    }, 1000);
+    setRecordIntervalId(interval);
   };
 
   const stopRecording = () => {
     mediaRecorder?.stop();
-    setIsRecording(false);
+    if (recordIntervalId) clearInterval(recordIntervalId);
   };
 
   const playNewRecording = () => {
@@ -130,117 +152,167 @@ export default function Recorder() {
   const playOldRecording = async () => {
     const sentence = sentences[currentIndex];
     const filename = sentence.id.toString().padStart(4, "0") + ".webm";
-    const path = `${voiceOwner}/${filename}`;
-
-    const { data } = supabase.storage.from("recordings").getPublicUrl(path);
-
-    if (!data?.publicUrl) {
-      console.error("Public URL not found.");
-      alert("Cannot find old recording.");
-      return;
+    const { data } = supabase.storage
+      .from("recordings")
+      .getPublicUrl(`${voiceOwner}/${filename}`);
+    if (data?.publicUrl) {
+      const audio = new Audio(data.publicUrl + "?v=" + Math.random());
+      audio.play();
     }
-
-    const audio = new Audio(data.publicUrl);
-
-    audio.onerror = (e) => {
-      console.error("Audio error:", e);
-      alert("Failed to load or play audio.");
-    };
-
-    audio.play();
   };
 
-  const saveRecording = async (blob: Blob) => {
-    const sentence = sentences[currentIndex];
-    const filename = sentence.id.toString().padStart(4, "0") + ".webm";
-    const filePath = `${voiceOwner}/${filename}`;
+  const saveRecording = async () => {
+    if (!recordedBlob) {
+      alert("No recording to save!");
+      return;
+    }
+    setIsSaving(true);
 
-    const { error: uploadError } = await supabase.storage
-      .from("recordings")
-      .upload(filePath, blob, {
-        cacheControl: "3600",
-        upsert: true,
-        contentType: "audio/webm",
+    try {
+      const sentence = sentences[currentIndex];
+      const filename = sentence.id.toString().padStart(4, "0") + ".webm";
+      const path = `${voiceOwner}/${filename}`;
+
+      if (recordedSentenceIds.includes(sentence.id)) {
+        const confirmReplace = confirm(
+          "❗This sentence already has a voice. Do you want to replace it?"
+        );
+        if (!confirmReplace) {
+          setIsSaving(false);
+          return;
+        }
+
+        const { error: deleteError } = await supabase.storage
+          .from("recordings")
+          .remove([path]);
+        if (deleteError) {
+          console.error("Error deleting old file:", deleteError);
+          throw deleteError;
+        }
+
+        const { error: dbDeleteError } = await supabase
+          .from("recordings")
+          .delete()
+          .eq("owner", voiceOwner)
+          .eq("sentence_id", sentence.id);
+
+        if (dbDeleteError) {
+          console.error("Error deleting old recording row:", dbDeleteError);
+          throw dbDeleteError;
+        }
+      }
+
+      const { error: uploadError } = await supabase.storage
+        .from("recordings")
+        .upload(path, recordedBlob, {
+          cacheControl: "0",
+          upsert: true,
+          contentType: "audio/webm",
+        });
+      if (uploadError) throw uploadError;
+
+      const storageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/recordings/${path}`;
+
+      const { error: insertError } = await supabase.from("recordings").upsert({
+        owner: voiceOwner,
+        filename,
+        sentence_id: sentence.id,
+        sentence: sentence.text,
+        storage_url: storageUrl,
       });
+      if (insertError) throw insertError;
 
-    if (uploadError) {
-      console.error("Upload error:", uploadError);
-      alert("Error uploading audio.");
-      return;
+      setRecordedSentenceIds((prev) =>
+        prev.includes(sentence.id) ? [...prev] : [...prev, sentence.id]
+      );
+
+      setSaveSuccess(true);
+      setRecordedBlob(null);
+      setStatusText("Saved successfully! ✅ Ready to Next.");
+      setStatusColor("text-green-500");
+      alert("✅ Saved successfully!");
+    } catch (err) {
+      console.error(err);
+      alert("Error saving recording!");
+    } finally {
+      setIsSaving(false);
     }
-
-    const storageUrl = `${process.env.NEXT_PUBLIC_SUPABASE_URL}/storage/v1/object/public/recordings/${filePath}`;
-
-    const { error: insertError } = await supabase.from("recordings").upsert({
-      owner: voiceOwner,
-      filename: filename,
-      sentence_id: sentence.id,
-      sentence: sentence.text,
-      storage_url: storageUrl,
-    });
-
-    if (insertError) {
-      console.error("Insert error:", insertError);
-      alert("Error saving metadata.");
-      return;
-    }
-
-    setRecordedSentenceIds((prev) => [...prev, sentence.id]);
   };
 
   const moveToNextSentence = () => {
+    if (isSaving) return alert("Saving... Please wait.");
+    if (recordedBlob && !saveSuccess)
+      return alert("Please save before moving.");
     if (currentIndex < sentences.length - 1) {
       setCurrentIndex(currentIndex + 1);
-      setRecordedBlob(null);
-    } else {
-      alert("All sentences completed!");
+      resetRecordingState();
     }
   };
 
-  const prevSentence = () => {
+  const moveToPrevSentence = () => {
+    if (isSaving) return alert("Saving... Please wait.");
+    if (recordedBlob && !saveSuccess)
+      return alert("Please save before moving.");
     if (currentIndex > 0) {
       setCurrentIndex(currentIndex - 1);
-      setRecordedBlob(null);
-    } else {
-      alert("Already at the first sentence!");
+      resetRecordingState();
     }
   };
 
   const jumpToSentence = (value: number) => {
     if (value >= 1 && value <= sentences.length) {
       setCurrentIndex(value - 1);
-      setRecordedBlob(null);
+      resetRecordingState();
     }
   };
 
+  const resetRecordingState = () => {
+    setRecordedBlob(null);
+    setSaveSuccess(false);
+    setStatusText("Ready to Record");
+    setStatusColor("text-gray-500");
+    setRecordTimer(0);
+    if (recordIntervalId) clearInterval(recordIntervalId);
+  };
+
+  function renderButton(
+    label: string,
+    onClick: () => void,
+    disabled: boolean,
+    activeClasses: string
+  ) {
+    return (
+      <button
+        onClick={onClick}
+        disabled={disabled}
+        className={`font-bold py-2 px-6 rounded ${
+          disabled
+            ? "bg-gray-400 text-white cursor-not-allowed"
+            : activeClasses + " text-white"
+        }`}
+      >
+        {label}
+      </button>
+    );
+  }
+
   return (
-    <div className="flex flex-col items-center gap-6 p-8">
-      {/* Progress Bar */}
-      <div className="w-full max-w-2xl bg-gray-300 rounded-full h-6 overflow-hidden">
+    <div className="flex flex-col items-center gap-6 p-6 max-w-5xl mx-auto">
+      {/* Progress bar */}
+      <div className="w-full bg-gray-300 rounded-full h-6 overflow-hidden">
         <div
           className="bg-green-500 h-full transition-all duration-500"
           style={{ width: `${progressPercent}%` }}
         />
       </div>
-
-      <div className="mt-2 text-center text-lg font-semibold">
+      <div className="text-center font-semibold">
         {progressPercent.toFixed(1)}% Completed
       </div>
 
-      {/* Recording Indicator */}
-      {isRecording && (
-        <div className="text-red-600 font-bold text-lg animate-pulse">
-          Recording... 🎙
-        </div>
-      )}
-
-      {/* Select Owner */}
+      {/* Owner selector */}
       <div className="flex flex-col items-center gap-2">
-        <label htmlFor="owner" className="font-semibold">
-          Select Voice Owner:
-        </label>
+        <label className="font-semibold">Select Voice Owner:</label>
         <select
-          id="owner"
           value={voiceOwner}
           onChange={(e) => setVoiceOwner(e.target.value)}
           className="border p-2 rounded-lg"
@@ -253,7 +325,7 @@ export default function Recorder() {
         </select>
       </div>
 
-      {/* Jump to Sentence */}
+      {/* Jump */}
       <div className="flex items-center gap-2">
         <label className="font-semibold">Jump to:</label>
         <input
@@ -261,70 +333,84 @@ export default function Recorder() {
           min="1"
           max={sentences.length}
           value={currentIndex + 1}
-          onChange={(e) => jumpToSentence(parseInt(e.target.value, 10))}
+          onChange={(e) => jumpToSentence(parseInt(e.target.value))}
           className="border p-2 rounded-lg w-24 text-center"
         />
         <span className="text-sm text-gray-500">(1 - {sentences.length})</span>
       </div>
 
-      {/* Current Sentence */}
-      <div className="text-2xl font-bold text-center">
-        {sentences[currentIndex].text}
+      {/* Current sentence */}
+      <div className="text-3xl font-bold text-center">
+        {sentences[currentIndex]?.text}
       </div>
 
-      {/* Current Status */}
-      <div className="text-lg font-semibold mt-2">
-        Current Status:{" "}
-        {isAlreadyRecorded ? (
-          <span className="text-green-500">✅ Already recorded</span>
-        ) : (
-          <span className="text-red-500">❌ Not recorded yet</span>
+      {/* Sentence status */}
+      <div
+        className={`font-semibold text-lg ${
+          isAlreadyRecorded ? "text-green-600" : "text-red-500"
+        }`}
+      >
+        {isAlreadyRecorded ? "✅ Already recorded" : "❌ Not recorded yet"}
+      </div>
+
+      {/* Timer */}
+      <div className="flex flex-col items-center gap-1">
+        {isRecording && (
+          <div className="text-red-600 font-semibold">
+            ⏺ Recording: {recordTimer}s
+          </div>
+        )}
+        {!isRecording && durations[sentences[currentIndex]?.id] && (
+          <div className="text-green-600 font-semibold">
+            ⏱ Duration: {durations[sentences[currentIndex].id].toFixed(1)}s
+          </div>
         )}
       </div>
 
       {/* Buttons */}
-      <div className="flex flex-wrap justify-center gap-4">
-        <button
-          onClick={startRecording}
-          className="bg-green-500 text-white px-4 py-2 rounded-lg"
-          disabled={isRecording}
-        >
-          🎙 Start
-        </button>
-        <button
-          onClick={stopRecording}
-          className="bg-red-500 text-white px-4 py-2 rounded-lg"
-          disabled={!isRecording}
-        >
-          🛑 Stop
-        </button>
-        <button
-          onClick={playNewRecording}
-          disabled={!recordedBlob || !isAlreadyRecorded}
-          className="bg-blue-500 text-white px-4 py-2 rounded-lg disabled:bg-blue-300"
-        >
-          ▶️ Play New
-        </button>
-        <button
-          onClick={playOldRecording}
-          disabled={!isAlreadyRecorded}
-          className="bg-yellow-500 text-black px-4 py-2 rounded-lg disabled:bg-yellow-300"
-        >
-          🕑 Play Old
-        </button>
-        <button
-          onClick={prevSentence}
-          disabled={currentIndex === 0}
-          className="bg-gray-500 text-white px-4 py-2 rounded-lg disabled:bg-gray-300"
-        >
-          ⏮ Prev
-        </button>
-        <button
-          onClick={moveToNextSentence}
-          className="bg-gray-500 text-white px-4 py-2 rounded-lg"
-        >
-          ⏭ Next
-        </button>
+      <div className="flex flex-wrap justify-center gap-4 mt-4">
+        {renderButton(
+          "🎙 Start",
+          startRecording,
+          isRecording,
+          "bg-green-500 hover:bg-green-600"
+        )}
+        {renderButton(
+          "🛑 Stop",
+          stopRecording,
+          !isRecording,
+          "bg-red-500 hover:bg-red-600"
+        )}
+        {renderButton(
+          "▶️ Play New",
+          playNewRecording,
+          !recordedBlob,
+          "bg-blue-500 hover:bg-blue-600"
+        )}
+        {renderButton(
+          "🕑 Play Old",
+          playOldRecording,
+          !isAlreadyRecorded,
+          "bg-yellow-400 hover:bg-yellow-500 text-black"
+        )}
+        {renderButton(
+          "💾 Save",
+          saveRecording,
+          !recordedBlob,
+          "bg-indigo-500 hover:bg-indigo-600"
+        )}
+        {renderButton(
+          "⏮ Prev",
+          moveToPrevSentence,
+          currentIndex === 0,
+          "bg-gray-500 hover:bg-gray-600"
+        )}
+        {renderButton(
+          "⏭ Next",
+          moveToNextSentence,
+          false,
+          "bg-gray-600 hover:bg-gray-700"
+        )}
       </div>
     </div>
   );
